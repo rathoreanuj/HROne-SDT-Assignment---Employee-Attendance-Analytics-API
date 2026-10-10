@@ -486,3 +486,129 @@ def punch_out(body: PunchOutRequest):
         if closed:
             raise HTTPException(409, detail="Record already punched out")
         raise HTTPException(404, detail="No open punch-in found for this employee")
+
+    punch_in_dt = record["punch_in"]
+    if punch_in_dt.tzinfo is None:
+        punch_in_dt = punch_in_dt.replace(tzinfo=timezone.utc)
+
+    # 422 validations
+    if ts_out <= punch_in_dt:
+        raise HTTPException(422, detail="punched_at must be after punch_in")
+    if (ts_out - punch_in_dt).total_seconds() > 86400:
+        raise HTTPException(422, detail="punched_at must be within 24 hours of punch_in")
+
+    wh = compute_work_hours(punch_in_dt, ts_out)
+    ot = compute_overtime_minutes(ts_out, emp["shift_end"], record["date"], emp["shift_start"])
+    hd = compute_half_day(wh)
+
+    # Atomic update: only update if punch_out is still null (concurrency)
+    result = db.attendance_logs.find_one_and_update(
+        {"_id": record["_id"], "punch_out": None},
+        {"$set": {"punch_out": ts_out, "work_hours": wh, "overtime_minutes": ot, "half_day": hd}},
+        return_document=True,
+    )
+    if result is None:
+        raise HTTPException(409, detail="Record already punched out by a concurrent request")
+
+    return record_to_api(result)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Attendance – list
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/attendance")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[str] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    if status and status not in ALL_STATUSES:
+        raise HTTPException(422, detail=f"status must be one of {ALL_STATUSES}")
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(422, detail="date_from must not be after date_to")
+
+    q: Dict[str, Any] = {}
+    if emp_code:
+        q["emp_code"] = emp_code
+    if date_from or date_to:
+        q["date"] = {}
+        if date_from:
+            q["date"]["$gte"] = date_from
+        if date_to:
+            q["date"]["$lte"] = date_to
+    if status:
+        q["status"] = status
+
+    total = db.attendance_logs.count_documents(q)
+    skip = (page - 1) * page_size
+    docs = list(
+        db.attendance_logs.find(q, {"_id": 0})
+        .sort([("date", DESCENDING), ("emp_code", ASCENDING)])
+        .skip(skip)
+        .limit(page_size)
+    )
+    return {
+        "items": [record_to_api(d) for d in docs],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Attendance – regularize (PATCH)
+# ─────────────────────────────────────────────────────────────────────────────
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(404, detail="Employee not found")
+
+    record = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if not record:
+        raise HTTPException(404, detail="Attendance record not found")
+
+    new_status = body.status if body.status is not None else record["status"]
+    new_pi_ms = body.punch_in
+    new_po_ms = body.punch_out
+
+    # Validate: ABSENT/LEAVE cannot have punch times
+    if new_status in ("ABSENT", "LEAVE"):
+        if new_pi_ms is not None or new_po_ms is not None:
+            raise HTTPException(422, detail="ABSENT/LEAVE status cannot have punch_in or punch_out")
+
+    # Resolve final punch_in
+    if new_status in ("ABSENT", "LEAVE"):
+        final_pi = None
+        final_po = None
+    else:
+        # presence status requires punch_in
+        if new_pi_ms is not None:
+            final_pi = ms_to_dt(new_pi_ms)
+        elif record.get("punch_in"):
+            pi = record["punch_in"]
+            final_pi = pi if pi.tzinfo else pi.replace(tzinfo=timezone.utc)
+        else:
+            raise HTTPException(422, detail="Presence status requires a punch_in")
+
+        if new_po_ms is not None:
+            final_po = ms_to_dt(new_po_ms)
+        elif record.get("punch_out"):
+            po = record["punch_out"]
+            final_po = po if po.tzinfo else po.replace(tzinfo=timezone.utc)
+        else:
+            final_po = None
+
+    # Validate punch_in date stays on the attendance date (R1)
+    if final_pi is not None:
+        pi_date = attendance_date_for_punch(final_pi, emp["shift_start"], emp["shift_end"])
+        if pi_date != date:
+            raise HTTPException(422, detail="punch_in must remain on the record's attendance date")
+
+    # Validate punch_out is after punch_in and within 24 hours
+    if final_pi is not None and final_po is not None:
+        if final_po <= final_pi:
+            raise HTTPException(422, detail="punch_out must be after punch_in")
