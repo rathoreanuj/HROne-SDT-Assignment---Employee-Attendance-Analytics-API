@@ -612,3 +612,115 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
     if final_pi is not None and final_po is not None:
         if final_po <= final_pi:
             raise HTTPException(422, detail="punch_out must be after punch_in")
+        if (final_po - final_pi).total_seconds() > 86400:
+            raise HTTPException(422, detail="punch_out must be within 24 hours of punch_in")
+
+    # Recompute derived fields
+    if new_status in ("ABSENT", "LEAVE"):
+        final_late = 0
+        final_wh = None
+        final_ot = 0
+        final_hd = False
+    elif final_pi is not None and final_po is not None:
+        final_late = compute_late_minutes(final_pi, emp["shift_start"], date)
+        final_wh = compute_work_hours(final_pi, final_po)
+        final_ot = compute_overtime_minutes(final_po, emp["shift_end"], date, emp["shift_start"])
+        final_hd = compute_half_day(final_wh)
+    elif final_pi is not None:
+        final_late = compute_late_minutes(final_pi, emp["shift_start"], date)
+        final_wh = None
+        final_ot = 0
+        final_hd = False
+    else:
+        final_late = 0
+        final_wh = None
+        final_ot = 0
+        final_hd = False
+
+    # Build changes dict — only fields that actually changed
+    old_pi = record.get("punch_in")
+    if old_pi and old_pi.tzinfo is None:
+        old_pi = old_pi.replace(tzinfo=timezone.utc)
+    old_po = record.get("punch_out")
+    if old_po and old_po.tzinfo is None:
+        old_po = old_po.replace(tzinfo=timezone.utc)
+
+    changes = {}
+    if new_status != record["status"]:
+        changes["status"] = {"from": record["status"], "to": new_status}
+    if final_pi != old_pi:
+        changes["punch_in"] = {
+            "from": dt_to_ms(old_pi) if old_pi else None,
+            "to": dt_to_ms(final_pi) if final_pi else None,
+        }
+    if final_po != old_po:
+        changes["punch_out"] = {
+            "from": dt_to_ms(old_po) if old_po else None,
+            "to": dt_to_ms(final_po) if final_po else None,
+        }
+    old_wh = record.get("work_hours")
+    if final_wh != old_wh:
+        changes["work_hours"] = {"from": old_wh, "to": final_wh}
+    old_late = record.get("late_minutes", 0)
+    if final_late != old_late:
+        changes["late_minutes"] = {"from": old_late, "to": final_late}
+    old_ot = record.get("overtime_minutes", 0)
+    if final_ot != old_ot:
+        changes["overtime_minutes"] = {"from": old_ot, "to": final_ot}
+    old_hd = record.get("half_day", False)
+    if final_hd != old_hd:
+        changes["half_day"] = {"from": old_hd, "to": final_hd}
+
+    if not changes:
+        raise HTTPException(422, detail="Request changes nothing")
+
+    history_entry = {
+        "at": datetime.now(tz=timezone.utc),
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": _changes_from_api(changes),
+    }
+
+    set_fields: Dict[str, Any] = {
+        "status": new_status,
+        "punch_in": final_pi,
+        "punch_out": final_po,
+        "work_hours": final_wh,
+        "late_minutes": final_late,
+        "overtime_minutes": final_ot,
+        "half_day": final_hd,
+    }
+
+    # Atomic: compare-and-swap on history length to detect concurrent edits
+    current_history_len = len(record.get("history") or [])
+    result = db.attendance_logs.find_one_and_update(
+        {
+            "_id": record["_id"],
+            "$expr": {"$eq": [{"$size": {"$ifNull": ["$history", []]}}, current_history_len]},
+        },
+        {"$set": set_fields, "$push": {"history": history_entry}},
+        return_document=True,
+    )
+    if result is None:
+        raise HTTPException(409, detail="Concurrent edit detected; please retry")
+
+    return record_to_api(result)
+
+
+def _changes_from_api(changes: dict) -> dict:
+    """Convert API-form changes (ms ints) to MongoDB-form (datetimes for punch fields)."""
+    out = {}
+    for field, val in changes.items():
+        if field in ("punch_in", "punch_out"):
+            from_val = val["from"]
+            to_val = val["to"]
+            out[field] = {
+                "from": ms_to_dt(from_val) if isinstance(from_val, int) else from_val,
+                "to": ms_to_dt(to_val) if isinstance(to_val, int) else to_val,
+            }
+        else:
+            out[field] = val
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
