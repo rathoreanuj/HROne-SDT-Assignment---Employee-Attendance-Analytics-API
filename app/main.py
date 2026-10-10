@@ -724,3 +724,152 @@ def _changes_from_api(changes: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Analytics – employee monthly
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$")):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(404, detail="Employee not found")
+
+    first_day, last_day = month_date_range(month)
+    # R7: working days counted from joined_on
+    effective_start = max(first_day, emp["joined_on"])
+
+    # Count working days (Mon-Fri) in [effective_start, last_day]
+    working_days = _count_working_days(effective_start, last_day)
+
+    pipeline = [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": first_day, "$lte": last_day}}},
+        {
+            "$group": {
+                "_id": None,
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$in": ["$status", list(PRESENCE_STATUSES)]},
+                                    {"$eq": [{"$dayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, 0]},  # placeholder
+                                ]
+                            },
+                            0,
+                            {
+                                "$cond": [
+                                    {"$in": ["$status", list(PRESENCE_STATUSES)]},
+                                    {
+                                        "$cond": [
+                                            {"$eq": [{"$ifNull": ["$half_day", False]}, True]},
+                                            0.5,
+                                            1.0,
+                                        ]
+                                    },
+                                    0,
+                                ]
+                            },
+                        ]
+                    }
+                },
+                "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+                "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+                "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+                "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+            }
+        },
+    ]
+
+    # Present_days: R7 only Mon-Fri. Build it in Python from aggregation over individual docs.
+    # More correct: do per-doc aggregation with dayOfWeek
+    pipeline2 = [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": first_day, "$lte": last_day}}},
+        {
+            "$addFields": {
+                "dow": {"$dayOfWeek": {"$dateFromString": {"dateString": "$date"}}},
+                # $dayOfWeek: 1=Sun, 2=Mon, ..., 6=Fri, 7=Sat
+                "is_weekday": {
+                    "$and": [
+                        {"$gte": [{"$dayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, 2]},
+                        {"$lte": [{"$dayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, 6]},
+                    ]
+                },
+                "is_presence": {"$in": ["$status", list(PRESENCE_STATUSES)]},
+                "half_day_val": {"$ifNull": ["$half_day", False]},
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {"$and": ["$is_presence", "$is_weekday"]},
+                            {"$cond": ["$half_day_val", 0.5, 1.0]},
+                            0,
+                        ]
+                    }
+                },
+                "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+                "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+                "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+                "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+            }
+        },
+    ]
+
+    rows = list(db.attendance_logs.aggregate(pipeline2))
+    if rows:
+        r = rows[0]
+        present_days = half_up(r["present_days"], 2)
+        leave_days = r["leave_days"]
+        late_count = r["late_count"]
+        total_late_minutes = r["total_late_minutes"]
+        total_overtime_minutes = r["total_overtime_minutes"]
+    else:
+        present_days = 0.0
+        leave_days = 0
+        late_count = 0
+        total_late_minutes = 0
+        total_overtime_minutes = 0
+
+    if working_days == 0:
+        attendance_pct = None
+    else:
+        attendance_pct = half_up(present_days / working_days * 100, 2)
+
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": leave_days,
+        "late_count": late_count,
+        "total_late_minutes": total_late_minutes,
+        "total_overtime_minutes": total_overtime_minutes,
+        "attendance_pct": attendance_pct,
+    }
+
+
+def _count_working_days(from_str: str, to_str: str) -> int:
+    """Count Mon-Fri days between from_str and to_str inclusive."""
+    from_d = datetime.fromisoformat(from_str).date()
+    to_d = datetime.fromisoformat(to_str).date()
+    if from_d > to_d:
+        return 0
+    count = 0
+    current = from_d
+    while current <= to_d:
+        if current.weekday() < 5:
+            count += 1
+        current += timedelta(days=1)
+    return count
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Analytics – department summary
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/analytics/departments/summary")
+def department_summary(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: Optional[str] = None,
+):
+    first_day, last_day = month_date_range(month)
