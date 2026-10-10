@@ -1,0 +1,19 @@
+# Environment variables
+.env
+
+# Python cache & artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Virtual environment
+.venv/
+env/
+venv/
+ENV/
+
+# Assignment documents
+*.docx
+PROBLEM_STATEMENT*
