@@ -363,3 +363,126 @@ def health():
     except Exception:
         raise HTTPException(503, detail="MongoDB unavailable")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Employees
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/employees", status_code=201)
+def create_employee(body: EmployeeCreate):
+    doc = body.model_dump()
+    doc["created_at"] = datetime.now(tz=timezone.utc)
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, detail="emp_code already exists")
+    doc.pop("_id", None)
+    return employee_to_api(doc)
+
+
+@app.get("/employees")
+def list_employees(
+    department: Optional[str] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    q = {}
+    if department:
+        q["department"] = department
+    total = db.employees.count_documents(q)
+    skip = (page - 1) * page_size
+    items = list(db.employees.find(q, {"_id": 0}).sort("emp_code", ASCENDING).skip(skip).limit(page_size))
+    return {
+        "items": [employee_to_api(e) for e in items],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@app.get("/employees/{emp_code}")
+def get_employee(emp_code: str):
+    emp = db.employees.find_one({"emp_code": emp_code}, {"_id": 0})
+    if not emp:
+        raise HTTPException(404, detail="Employee not found")
+    return employee_to_api(emp)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Attendance – punch-in
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/attendance/punch-in", status_code=201)
+def punch_in(body: PunchInRequest):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if not emp:
+        raise HTTPException(404, detail="Employee not found")
+
+    # R1: truncate to whole seconds
+    if body.punched_at is not None:
+        ts = ms_to_dt(body.punched_at)
+    else:
+        ts = datetime.now(tz=timezone.utc).replace(microsecond=0)
+
+    date_str = attendance_date_for_punch(ts, emp["shift_start"], emp["shift_end"])
+    late_min = compute_late_minutes(ts, emp["shift_start"], date_str)
+
+    doc = {
+        "emp_code": body.emp_code,
+        "date": date_str,
+        "status": body.status,
+        "punch_in": ts,
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": late_min,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    }
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, detail="Already punched in for this attendance date")
+
+    doc.pop("_id", None)
+    return record_to_api(doc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Attendance – punch-out
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/attendance/punch-out", status_code=200)
+def punch_out(body: PunchOutRequest):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if not emp:
+        raise HTTPException(404, detail="Employee not found")
+
+    # R1: truncate to whole seconds
+    if body.punched_at is not None:
+        ts_out = ms_to_dt(body.punched_at)
+    else:
+        ts_out = datetime.now(tz=timezone.utc).replace(microsecond=0)
+
+    # Find the most recent open record whose punch_in <= ts_out
+    record = db.attendance_logs.find_one(
+        {
+            "emp_code": body.emp_code,
+            "status": {"$in": list(PRESENCE_STATUSES)},
+            "punch_in": {"$lte": ts_out},
+            "punch_out": None,
+        },
+        sort=[("punch_in", DESCENDING)],
+    )
+
+    if not record:
+        # Check if there's a record that's already punched out
+        closed = db.attendance_logs.find_one(
+            {
+                "emp_code": body.emp_code,
+                "status": {"$in": list(PRESENCE_STATUSES)},
+                "punch_in": {"$lte": ts_out},
+                "punch_out": {"$ne": None},
+            },
+            sort=[("punch_in", DESCENDING)],
+        )
+        if closed:
+            raise HTTPException(409, detail="Record already punched out")
+        raise HTTPException(404, detail="No open punch-in found for this employee")
