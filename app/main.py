@@ -1246,3 +1246,174 @@ def department_trend(
 # ─────────────────────────────────────────────────────────────────────────────
 # Admin – explain
 # ─────────────────────────────────────────────────────────────────────────────
+EXPLAIN_ENDPOINTS = ["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"]
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: str,
+    emp_code: Optional[str] = None,
+    month: Optional[str] = Query(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: Optional[str] = None,
+    limit: int = Query(default=10, ge=1, le=50),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[str] = None,
+    from_: Optional[str] = Query(default=None, alias="from"),
+    to: Optional[str] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    if endpoint not in EXPLAIN_ENDPOINTS:
+        raise HTTPException(422, detail=f"endpoint must be one of {EXPLAIN_ENDPOINTS}")
+
+    if endpoint == "attendance_list":
+        q: Dict[str, Any] = {}
+        if emp_code:
+            q["emp_code"] = emp_code
+        if date_from or date_to:
+            q["date"] = {}
+            if date_from:
+                q["date"]["$gte"] = date_from
+            if date_to:
+                q["date"]["$lte"] = date_to
+        if status:
+            q["status"] = status
+        skip = (page - 1) * page_size
+        explain_result = db.command(
+            "explain",
+            {
+                "find": "attendance_logs",
+                "filter": q,
+                "sort": {"date": -1, "emp_code": 1},
+                "skip": skip,
+                "limit": page_size,
+            },
+            verbosity="executionStats",
+        )
+        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain_result}
+
+    elif endpoint == "employee_monthly":
+        if not emp_code or not month:
+            raise HTTPException(422, detail="emp_code and month are required for employee_monthly")
+        first_day, last_day = month_date_range(month)
+        pipeline = [
+            {"$match": {"emp_code": emp_code, "date": {"$gte": first_day, "$lte": last_day}}},
+            {
+                "$addFields": {
+                    "is_weekday": {
+                        "$and": [
+                            {"$gte": [{"$dayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, 2]},
+                            {"$lte": [{"$dayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, 6]},
+                        ]
+                    },
+                    "is_presence": {"$in": ["$status", list(PRESENCE_STATUSES)]},
+                }
+            },
+            {
+                "$group": {
+                    "_id": None,
+                    "present_days": {"$sum": {"$cond": [{"$and": ["$is_presence", "$is_weekday"]}, {"$cond": [{"$ifNull": ["$half_day", False]}, 0.5, 1.0]}, 0]}},
+                    "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+                    "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+                    "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+                    "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+                }
+            },
+        ]
+        explain_result = db.command(
+            "explain",
+            {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}},
+            verbosity="executionStats",
+        )
+        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain_result}
+
+    elif endpoint == "department_summary":
+        if not month:
+            raise HTTPException(422, detail="month is required for department_summary")
+        first_day, last_day = month_date_range(month)
+        emp_match: Dict[str, Any] = {"joined_on": {"$lte": last_day}}
+        if department:
+            emp_match["department"] = department
+        pipeline = [
+            {"$match": emp_match},
+            {
+                "$lookup": {
+                    "from": "attendance_logs",
+                    "let": {"ec": "$emp_code"},
+                    "pipeline": [
+                        {
+                            "$match": {
+                                "$expr": {"$eq": ["$emp_code", "$$ec"]},
+                                "date": {"$gte": first_day, "$lte": last_day},
+                            }
+                        }
+                    ],
+                    "as": "logs",
+                }
+            },
+            {"$group": {"_id": "$department", "headcount": {"$addToSet": "$emp_code"}}},
+        ]
+        explain_result = db.command(
+            "explain",
+            {"aggregate": "employees", "pipeline": pipeline, "cursor": {}},
+            verbosity="executionStats",
+        )
+        return {"endpoint": endpoint, "collection": "employees", "explain": explain_result}
+
+    elif endpoint == "late_leaderboard":
+        if not month:
+            raise HTTPException(422, detail="month is required for late_leaderboard")
+        first_day, last_day = month_date_range(month)
+        match: Dict[str, Any] = {
+            "date": {"$gte": first_day, "$lte": last_day},
+            "late_minutes": {"$gt": 0},
+        }
+        pipeline = [
+            {"$match": match},
+            {
+                "$lookup": {
+                    "from": "employees",
+                    "localField": "emp_code",
+                    "foreignField": "emp_code",
+                    "as": "emp_info",
+                }
+            },
+            {"$unwind": "$emp_info"},
+        ]
+        if department:
+            pipeline.append({"$match": {"emp_info.department": department}})
+        pipeline.append({"$group": {"_id": "$emp_code", "total_late_minutes": {"$sum": "$late_minutes"}}})
+        explain_result = db.command(
+            "explain",
+            {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}},
+            verbosity="executionStats",
+        )
+        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain_result}
+
+    elif endpoint == "department_trend":
+        if not department or not from_ or not to:
+            raise HTTPException(422, detail="department, from, and to are required for department_trend")
+        match: Dict[str, Any] = {"date": {"$gte": from_, "$lte": to}}
+        pipeline = [
+            {"$match": match},
+            {
+                "$lookup": {
+                    "from": "employees",
+                    "localField": "emp_code",
+                    "foreignField": "emp_code",
+                    "as": "emp_info",
+                }
+            },
+            {"$unwind": "$emp_info"},
+            {"$match": {"emp_info.department": department}},
+            {"$group": {"_id": "$date", "present_count_raw": {"$sum": 1}}},
+        ]
+        explain_result = db.command(
+            "explain",
+            {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}},
+            verbosity="executionStats",
+        )
+        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain_result}
+
+    raise HTTPException(422, detail="Unknown endpoint")
