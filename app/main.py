@@ -1006,3 +1006,243 @@ def department_summary(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Analytics – late leaderboard
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    limit: int = Query(default=10, ge=1, le=50),
+    department: Optional[str] = None,
+):
+    first_day, last_day = month_date_range(month)
+
+    # Join attendance_logs with employees, filter by department if needed
+    emp_match: Dict[str, Any] = {}
+    if department:
+        emp_match["department"] = department
+
+    pipeline = [
+        # Start from attendance_logs for the month with late_minutes > 0
+        {
+            "$match": {
+                "date": {"$gte": first_day, "$lte": last_day},
+                "late_minutes": {"$gt": 0},
+            }
+        },
+        # Lookup employee info
+        {
+            "$lookup": {
+                "from": "employees",
+                "localField": "emp_code",
+                "foreignField": "emp_code",
+                "as": "emp_info",
+            }
+        },
+        {"$unwind": "$emp_info"},
+    ]
+
+    if department:
+        pipeline.append({"$match": {"emp_info.department": department}})
+
+    pipeline += [
+        {
+            "$group": {
+                "_id": "$emp_code",
+                "name": {"$first": "$emp_info.name"},
+                "department": {"$first": "$emp_info.department"},
+                "total_late_minutes": {"$sum": "$late_minutes"},
+                "late_count": {"$sum": 1},
+            }
+        },
+        {"$sort": {"total_late_minutes": DESCENDING, "_id": ASCENDING}},
+        # Standard competition ranking
+        {
+            "$setWindowFields": {
+                "sortBy": {"total_late_minutes": -1},
+                "output": {
+                    "rank": {
+                        "$rank": {},
+                    }
+                },
+            }
+        },
+        {"$match": {"rank": {"$lte": limit}}},
+        {"$sort": {"total_late_minutes": DESCENDING, "_id": ASCENDING}},
+        {
+            "$project": {
+                "_id": 0,
+                "rank": 1,
+                "emp_code": "$_id",
+                "name": 1,
+                "department": 1,
+                "total_late_minutes": 1,
+                "late_count": 1,
+            }
+        },
+    ]
+
+    items = list(db.attendance_logs.aggregate(pipeline))
+    return {"month": month, "items": items}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Analytics – department trend
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    from_: str = Query(..., alias="from"),
+    to: str = Query(...),
+):
+    # Validate range
+    if to < from_:
+        raise HTTPException(422, detail="'to' must not be before 'from'")
+    from_d = datetime.fromisoformat(from_)
+    to_d = datetime.fromisoformat(to)
+    if (to_d - from_d).days > 92:
+        raise HTTPException(422, detail="Date range must not exceed 92 days")
+
+    # Check department exists
+    dept_count = db.employees.count_documents({"department": department})
+    if dept_count == 0:
+        raise HTTPException(404, detail="Department not found")
+
+    # Use $densify to get one row per calendar day in [from_, to]
+    pipeline = [
+        # Match logs for the department's employees in date range
+        {
+            "$match": {
+                "date": {"$gte": from_, "$lte": to},
+            }
+        },
+        {
+            "$lookup": {
+                "from": "employees",
+                "localField": "emp_code",
+                "foreignField": "emp_code",
+                "as": "emp_info",
+            }
+        },
+        {"$unwind": "$emp_info"},
+        {"$match": {"emp_info.department": department}},
+        {
+            "$addFields": {
+                "is_presence": {"$in": ["$status", list(PRESENCE_STATUSES)]},
+                "half_day_val": {"$ifNull": ["$half_day", False]},
+                "date_as_date": {"$dateFromString": {"dateString": "$date"}},
+            }
+        },
+        {
+            "$group": {
+                "_id": "$date",
+                "present_count_raw": {
+                    "$sum": {
+                        "$cond": [
+                            "$is_presence",
+                            {"$cond": ["$half_day_val", 0.5, 1.0]},
+                            0,
+                        ]
+                    }
+                },
+                "late_count": {
+                    "$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}
+                },
+                "date_as_date": {"$first": {"$dateFromString": {"dateString": "$date"}}},
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "date": "$_id",
+                "date_as_date": 1,
+                "present_count_raw": 1,
+                "late_count": 1,
+            }
+        },
+        # Densify to fill gaps
+        {
+            "$densify": {
+                "field": "date_as_date",
+                "range": {
+                    "step": 1,
+                    "unit": "day",
+                    "bounds": [
+                        datetime.fromisoformat(from_).replace(tzinfo=timezone.utc),
+                        datetime.fromisoformat(to).replace(tzinfo=timezone.utc) + timedelta(days=1),
+                    ],
+                },
+            }
+        },
+        {
+            "$addFields": {
+                "date": {
+                    "$ifNull": [
+                        "$date",
+                        {
+                            "$dateToString": {
+                                "format": "%Y-%m-%d",
+                                "date": "$date_as_date",
+                            }
+                        },
+                    ]
+                },
+                "present_count_raw": {"$ifNull": ["$present_count_raw", 0]},
+                "late_count": {"$ifNull": ["$late_count", 0]},
+            }
+        },
+        {"$sort": {"date": ASCENDING}},
+    ]
+
+    # Execute to get per-day log counts
+    log_rows = {r["date"]: r for r in db.attendance_logs.aggregate(pipeline)}
+
+    # Build per-day headcount from employees
+    # headcount(day) = employees with department=department and joined_on <= day
+    # We do this per-day in Python since range is at most 92 days
+    current = from_d.date()
+    end = to_d.date()
+    result_items = []
+
+    while current <= end:
+        date_str = current.isoformat()
+        headcount = db.employees.count_documents(
+            {"department": department, "joined_on": {"$lte": date_str}}
+        )
+        log_row = log_rows.get(date_str, {})
+        present_count = log_row.get("present_count_raw", 0)
+        late_count = log_row.get("late_count", 0)
+        is_wd = current.weekday() < 5
+
+        if is_wd and headcount > 0:
+            attendance_rate = half_up(present_count / headcount, 4)
+        else:
+            attendance_rate = None
+
+        result_items.append(
+            {
+                "date": date_str,
+                "is_working_day": is_wd,
+                "headcount": headcount,
+                "present_count": present_count,
+                "late_count": late_count,
+                "attendance_rate": attendance_rate,
+                "moving_avg_7d": None,  # computed below
+            }
+        )
+        current += timedelta(days=1)
+
+    # Compute moving_avg_7d: mean of non-null attendance_rate in window [max(0, i-6), i]
+    for i, row in enumerate(result_items):
+        window = result_items[max(0, i - 6) : i + 1]
+        non_null = [w["attendance_rate"] for w in window if w["attendance_rate"] is not None]
+        if non_null:
+            row["moving_avg_7d"] = half_up(sum(non_null) / len(non_null), 4)
+        else:
+            row["moving_avg_7d"] = None
+
+    return {"department": department, "items": result_items}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Admin – explain
+# ─────────────────────────────────────────────────────────────────────────────
